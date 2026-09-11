@@ -1534,28 +1534,32 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 
 def set_model_override(
     conn: sqlite3.Connection, task_id: str, model: Optional[str], provider: Optional[str] = None,
+    *, expected_status: Optional[str] = None,
 ) -> bool:
     """Set (empty ``model`` clears BOTH) the per-task model/provider override.
     Allowed while ``running``: it applies on the NEXT dispatch, which is the
-    rate-limit-recovery flow (set, then reclaim/retry)."""
+    rate-limit-recovery flow (set, then reclaim/retry). When expected_status is
+    supplied, compare it inside the same IMMEDIATE transaction as the write;
+    a concurrent claim causes False with no override/event mutation."""
     model, provider = _validate_model_override(model, provider)
     return _set_task_override(
         conn, task_id,
         "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
         "model_override_set", {"model": model, "provider": provider},
         ("model_override", "provider_override"), archived_msg="cannot set model override",
+        expected_status=expected_status,
     )
 
 
 def _set_task_override(
     conn: sqlite3.Connection, task_id: str, sql: str, params: tuple, event_kind: str, payload: dict,
-    changed_fields: tuple[str, ...], *, archived_msg: str,
+    changed_fields: tuple[str, ...], *, archived_msg: str, expected_status: Optional[str] = None,
 ) -> bool:
     """Per-task override write: refuse archived tasks, record ``event_kind``,
     then fire the task-updated observer AFTER commit (RFC #58548)."""
     with write_txn(conn):
         status = _task_status(conn, task_id)
-        if status is None:
+        if status is None or (expected_status is not None and status != expected_status):
             return False
         if status == "archived":
             raise RuntimeError(f"{archived_msg} on archived task {task_id}")

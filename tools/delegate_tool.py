@@ -24,14 +24,16 @@ logger = logging.getLogger(__name__)
 # The delegate_tool_* siblings hold the pieces split out of this module; every name callers or patching tests reach as
 # ``tools.delegate_tool.<name>`` is re-imported here. Mutable flag globals live only in their owning module.
 from tools.delegate_tool_child_run import (  # noqa: F401
-    _ChildRun, _attach_child, _build_result_entry, _dump_subagent_timeout_diagnostic, _fabricated_entry,
-    _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
+    _ChildRun, _attach_child, _build_result_entry, _close_child, _detach_child, _dump_subagent_timeout_diagnostic,
+    _fabricated_entry, _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat,
+    _validate_child_output_schema,
 )
 from tools.delegate_tool_config import (  # noqa: F401
-    _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
-    _get_max_spawn_depth, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
-    _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials, _subagent_auto_approve, _subagent_auto_deny,
+    _DEFAULT_MAX_CONCURRENT_CHILDREN, _empty_credential_bundle, _get_child_timeout, _get_max_async_children,
+    _get_max_concurrent_children, _get_max_spawn_depth, _get_orchestrator_enabled, _get_subagent_approval_callback,
+    _get_worktree_isolation, _inherit_parent_capabilities, _load_config, _merge_request_overrides,
+    _resolve_child_credential_pool, _resolve_child_runtime, _resolve_delegation_credentials,
+    _resolve_task_credentials, _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
 from tools.delegate_tool_progress import (  # noqa: F401
@@ -297,36 +299,66 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
-def _build_children(
-    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
-    top_role: str, max_iterations: int, parent_agent, live_deleg_id: Optional[str], live_writers: list,
-) -> tuple[List[tuple], Optional[str]]:
-    """Build every child on the main thread (construction is not thread-safe);
-    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
-    from tools.delegation_live_log import wrap_progress_callback
-    from tools.delegation_output_schema import append_output_contract
-    overrides = {
+def _overrides_from_creds(creds: Dict[str, Any]) -> Dict[str, Any]:
+    return {
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
         "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
         "override_request_overrides": creds.get("request_overrides"),
         "override_max_tokens": creds.get("max_output_tokens"), "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
     }
+
+def _cleanup_partial_children(built: List[Any], parent_agent) -> None:
+    """Best-effort teardown for children already constructed before a LATER task in the same
+    batch fails validation/construction: a partial batch must never leave orphaned child
+    agents/resources (session db handles, tool sandboxes, httpx clients) behind."""
+    for child in built:
+        _detach_child(parent_agent, child)
+        _close_child(child, "subagent: cleanup after batch construction failure failed")
+
+def _build_children(
+    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
+    top_role: str, max_iterations: int, parent_agent, live_deleg_id: Optional[str], live_writers: list, cfg: dict,
+) -> tuple[List[tuple], Optional[str]]:
+    """Build every child on the main thread (construction is not thread-safe);
+    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure. ``creds`` is
+    the batch/default bundle; each task may layer its own 'model'/'provider' override on top of
+    it via ``_resolve_task_credentials`` (byte-identical to today when a task has neither).
+    Validation of the whole batch already happened in ``_normalize_task_list`` before this
+    runs; any resolution/construction failure discovered here (e.g. an unresolvable named
+    provider) still fails the WHOLE call, cleaning up any children already built for earlier
+    tasks in this same batch."""
+    from tools.delegation_live_log import wrap_progress_callback
+    from tools.delegation_output_schema import append_output_contract
     children = []
+    built_children: List[Any] = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
         try:
+            task_creds = _resolve_task_credentials(t, creds, cfg, parent_agent)
+        except ValueError as exc:
+            _cleanup_partial_children(built_children, parent_agent)
+            return [], str(exc)
+        try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                model=task_creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                **_overrides_from_creds(task_creds),
             )
         except ValueError as exc:
+            _cleanup_partial_children(built_children, parent_agent)
             return [], str(exc)
+        built_children.append(child)
+        # Requested (as literally supplied on the task) vs. resolved (the child's actual
+        # route) identity — result entries must not conflate the two, and must never show one
+        # batch-uniform model/provider across a heterogeneous batch.
+        child._requested_model = t.get("model")
+        child._requested_provider = t.get("provider")
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -394,20 +426,31 @@ def delegate_task(
             "delegate_task: ignoring caller-supplied max_iterations=%s; using delegation.max_iterations=%s from config",
             max_iterations, default_max_iter,
         )
-    # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
-    # a per-call override shaped like the delegation config section.
-    try:
-        creds = _resolve_delegation_credentials(credentials_cfg if credentials_cfg else cfg, parent_agent)
-    except ValueError as exc:
-        # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
-        # spawn loudly (#80450).
-        return tool_error(str(exc))
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if err:
         return tool_error(err)
+
+    # The batch/default bundle is only needed by tasks that actually inherit from it (no
+    # override, or a model-only override) — a task with BOTH 'model' and 'provider' resolves
+    # its own fully independent bundle and never touches this one. An all-explicit batch must
+    # not fail just because the unused batch/default provider is unavailable.
+    _tasks_need_default = any(
+        not (isinstance(t.get("provider"), str) and isinstance(t.get("model"), str)) for t in task_list
+    )
+    # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
+    # a per-call override shaped like the delegation config section.
+    try:
+        creds = (
+            _resolve_delegation_credentials(credentials_cfg if credentials_cfg else cfg, parent_agent)
+            if _tasks_need_default else _empty_credential_bundle()
+        )
+    except ValueError as exc:
+        # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
+        # spawn loudly (#80450).
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
@@ -421,7 +464,7 @@ def delegate_task(
 
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        live_deleg_id=live_deleg_id, live_writers=live_writers,
+        live_deleg_id=live_deleg_id, live_writers=live_writers, cfg=credentials_cfg if credentials_cfg else cfg,
     )
     if err:
         return tool_error(err)
@@ -478,7 +521,9 @@ _DESCRIPTION_HEAD = (
     "succeeded.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
+    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml, "
+    "or via a per-task 'model'/'provider' below (each task's route resolves independently; 'provider' requires "
+    "'model' on the same task)."
 )
 
 def _build_tasks_param_description() -> str:
@@ -545,6 +590,20 @@ DELEGATE_TASK_SCHEMA = {
                             "child up front; parent validates with one bounded correction retry; result gains "
                             "schema_valid, plus schema_errors on failure). Keep it forgiving — require only "
                             "fields you will read.",
+                        ),
+                        "model": _p(
+                            "string",
+                            "Optional per-task model override, e.g. 'anthropic/claude-sonnet-4'. Exact string, no "
+                            "surrounding whitespace. Alone (no 'provider'), resolves against the effective "
+                            "delegated/parent provider — combine with 'provider' to pin both independently of "
+                            "every other task in this batch.",
+                        ),
+                        "provider": _p(
+                            "string",
+                            "Optional per-task provider override. REQUIRES 'model' on the same task — rejected "
+                            "(whole call, before any subagent spawns) if set without it. Resolves a fully "
+                            "independent credential/endpoint bundle for this task only; other tasks in the same "
+                            "batch are unaffected.",
                         ),
                     },
                     "required": ["goal"],

@@ -378,6 +378,39 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         )
     return _runtime_provider_credentials(values, explicit_request_overrides)
 
+def _empty_credential_bundle() -> dict:
+    """Placeholder batch bundle for a call whose EVERY task supplies its own explicit
+    provider+model: the batch/default bundle is never actually applied to any child in that
+    case, so it must not have to resolve (an unused broken default must not block an
+    all-explicit batch)."""
+    return _credential_bundle(None, None, None, None, None, None, None)
+
+def _resolve_task_credentials(task: Dict[str, Any], batch_creds: Dict[str, Any], cfg: dict, parent_agent) -> Dict[str, Any]:
+    """Per-task credential bundle for one task in a batch, layered over the already-resolved
+    ``batch_creds`` (the batch/default bundle). Three cases:
+
+    - no 'model' and no 'provider' on the task -> ``batch_creds`` unchanged (today's behavior,
+      byte-identical).
+    - 'model' only -> ``batch_creds`` with just the model replaced (uses the effective
+      delegated/parent provider already resolved into ``batch_creds`` — never parses the model
+      string for a provider hint).
+    - 'provider' (+ required 'model', already preflight-validated) -> a FRESH full-bundle
+      resolution via ``_resolve_delegation_credentials``, never a bare ``override_provider=``
+      pass-through (a partial pass-through would leak the batch/parent base_url+api_key to a
+      different provider's endpoint — see runtime-audit.md gap F). The batch's explicit
+      ``request_overrides`` (if any) still merges over this fresh bundle's runtime overrides,
+      same precedence contract as every other resolution branch.
+    """
+    task_model, task_provider = task.get("model"), task.get("provider")
+    if task_model is None and task_provider is None:
+        return batch_creds
+    if task_provider is None:
+        return {**batch_creds, "model": task_model}
+    task_cfg: Dict[str, Any] = {"model": task_model, "provider": task_provider}
+    if isinstance(cfg.get("request_overrides"), dict):
+        task_cfg["request_overrides"] = cfg["request_overrides"]
+    return _resolve_delegation_credentials(task_cfg, parent_agent)
+
 def _load_config() -> dict:
     """The ``delegation`` config section (read-only — do NOT mutate). Prefers the shared ``load_config_readonly()``
     (follows HERMES_HOME/profile; no deepcopy, since this runs on every get_definitions() rebuild) over the legacy

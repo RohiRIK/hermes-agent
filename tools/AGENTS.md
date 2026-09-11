@@ -87,6 +87,10 @@ no `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`; keeps `execu
 subagent_auto_approve, inherit_mcp_toolsets, max_iterations`. **Durability:** background
 delegation is process-local; work that must survive restart uses `cronjob` or
 `terminal(background=True, notify_on_complete=True)`. API: `website/docs/developer-guide/subagent-lifecycle-api.md`.
+Each task in `tasks=[...]` may also carry its own `model`/`provider` (provider requires model;
+resolved independently per task via `tools/delegate_tool_config.py::_resolve_task_credentials`,
+never a bare provider substitution) — same full-bundle contract as the public lifecycle API's
+`SubagentLaunchRequest.provider`.
 
 ## Tests
 

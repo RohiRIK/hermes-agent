@@ -30,6 +30,31 @@ def launch_review(ctx):
     return service.result(handle)
 ```
 
+`provider` (optional, keyword) pins this child to a specific provider, resolved through the
+same full credential/endpoint bundle `delegate_task`'s per-task `provider` uses (never a bare
+provider-name substitution) — base_url, api_key, api_mode and request personality all come from
+that one provider, isolated from whatever the parent session is currently using. `provider`
+**requires** `model` on the same request; setting it without a model is rejected before any
+child spawns. Omitting `provider` preserves the exact historical behavior: the child fully
+inherits the parent's route (it does not fall back to a config-level `delegation.provider`).
+`handle.provider`/`handle.model` always reflect the child's actual *resolved* route, whether or
+not `provider` was set on the request.
+
+`expected_endpoint` is an optional exact-string guard for policy-driven callers.
+It requires an explicit provider. After resolving that provider's credential bundle,
+Hermes compares its `base_url` with this value **before** constructing the child
+or issuing network requests; a mismatch fails closed. It does not set a URL or
+normalize identifiers. Account-specific credential selection is not implied by
+this field. Existing callers that omit it keep their previous behavior.
+
+```python
+handle = service.launch(SubagentLaunchRequest(
+    goal="Summarize this log file with a cheaper model.",
+    model="some-provider/small-model",
+    provider="some-provider",
+))
+```
+
 `SubagentHandle` is serializable and carries a versioned, opaque capability.
 Pass it back to `status`, `wait`, `cancel`, `result`, or `reconnect`; malformed
 or forged handles return `UNKNOWN`/`UNKNOWN_HANDLE` and cannot access a child.
@@ -58,4 +83,6 @@ Requests are fail-closed: goal/context/metadata sizes are capped, unknown or
 parent-broadening toolsets are rejected, and per-tool blocks, working-directory
 overrides, and per-launch timeouts are explicitly rejected until Hermes can
 support them without weakening isolation. Use `allowed_toolsets` to narrow a
-child; Hermes's existing unsafe-tool block remains enforced.
+child; Hermes's existing unsafe-tool block remains enforced. `provider` set
+without `model`, or a `provider` that is empty/non-string/has surrounding
+whitespace, is rejected the same way.

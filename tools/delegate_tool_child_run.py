@@ -493,6 +493,7 @@ def _build_result_entry(
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
         "model": _str_or_none(getattr(child, "model", None)),
+        "provider": _str_or_none(getattr(child, "provider", None)),
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
@@ -508,6 +509,16 @@ def _build_result_entry(
         "_child_role": getattr(child, "_delegate_role", None),
         "_child_cost_usd": float(_cost or 0.0) if isinstance(_cost, (int, float)) else 0.0,
     }
+    # As-supplied task 'model'/'provider' (only when the task actually set one), distinct from
+    # "model"/"provider" above (the child's ACTUAL resolved route) — a heterogeneous batch must
+    # never look like every task got the same route, and requested != resolved is a legitimate,
+    # visible outcome (e.g. a model-only override resolving through the delegated provider).
+    _requested_model = _str_or_none(getattr(child, "_requested_model", None))
+    _requested_provider = _str_or_none(getattr(child, "_requested_provider", None))
+    if _requested_model is not None:
+        entry["requested_model"] = _requested_model
+    if _requested_provider is not None:
+        entry["requested_provider"] = _requested_provider
     # Model-visible per-delegation spend (unlike _child_cost_usd above).
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"

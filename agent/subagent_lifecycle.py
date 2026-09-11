@@ -58,6 +58,11 @@ class SubagentLaunchRequest:
     correlation_id: Optional[str] = None
     metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     timeout_seconds: Optional[float] = None
+    # Appended last (never inserted earlier) so existing positional callers are unaffected.
+    # None preserves the exact historical behavior: full parent inheritance, no override_*
+    # kwargs at all -- it does NOT fall back to config-level delegation.provider.
+    provider: Optional[str] = None
+    expected_endpoint: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,6 +232,9 @@ _REQUEST_REJECTIONS: tuple[tuple[Callable[[Any], bool], str], ...] = (
      "working_directory is not supported because Hermes delegates use isolated task environments."),
     (lambda r: bool(r.blocked_tools),
      "Per-tool blocking is not supported; use allowed_toolsets. Hermes always blocks unsafe child tools."),
+    (lambda r: r.provider is not None and (not isinstance(r.provider, str) or r.provider == "" or r.provider != r.provider.strip()),
+     "provider must be a non-empty string with no leading/trailing whitespace."),
+    (lambda r: r.provider is not None and not r.model, "provider requires model."),
 )
 
 
@@ -247,6 +255,10 @@ class SubagentLifecycleService:
         if parent is None:
             raise SubagentLifecycleError("No active Hermes parent session is available.")
         self._validate_request(request, parent)
+        if request.expected_endpoint is not None:
+            if (request.provider is None or not isinstance(request.expected_endpoint, str)
+                    or not request.expected_endpoint or request.expected_endpoint.strip() != request.expected_endpoint):
+                raise SubagentLifecycleError("expected_endpoint requires an explicit provider and a nonempty exact endpoint.")
         parent_session_id = _session_id_of(parent)
         if request.parent_session_id and request.parent_session_id != parent_session_id:
             raise SubagentLifecycleError("parent_session_id does not match the active session.")
@@ -257,10 +269,33 @@ class SubagentLifecycleService:
                 raise SubagentLifecycleError("Duplicate correlation_id for this parent session.")
         # Lazy: delegate construction stays internal, plugins never import private delegation helpers.
         from tools.delegate_tool import _build_child_preserving_parent_tools, DEFAULT_MAX_ITERATIONS
+        route_overrides: dict[str, Any] = {}
+        if request.provider is not None:
+            # Same full-bundle resolver delegate_task's per-task provider override uses --
+            # never a bare override_provider=, which would leak the parent's base_url/api_key
+            # to a different provider's endpoint (runtime-audit.md gap F).
+            from tools.delegate_tool_config import _resolve_delegation_credentials
+            try:
+                bundle = _resolve_delegation_credentials({"model": request.model, "provider": request.provider}, parent)
+            except ValueError as exc:
+                raise SubagentLifecycleError(str(exc)) from exc
+            if request.expected_endpoint is not None and bundle["base_url"] != request.expected_endpoint:
+                raise SubagentLifecycleError("Resolved endpoint does not match expected_endpoint.")
+            route_overrides = dict(
+                override_provider=bundle["provider"], override_base_url=bundle["base_url"],
+                override_api_key=bundle["api_key"], override_api_mode=bundle["api_mode"],
+                override_request_overrides=bundle.get("request_overrides"),
+                override_max_tokens=bundle.get("max_output_tokens"),
+                override_acp_command=bundle.get("command"), override_acp_args=bundle.get("args"),
+            )
+        # provider omitted (route_overrides == {}) passes NO override_* kwargs at all -- the
+        # exact historical call shape, full parent inheritance, never a silent switch onto
+        # config-level delegation.provider.
         child = _build_child_preserving_parent_tools(
             task_index=0, goal=request.goal, context=request.context,
             toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
             model=request.model, max_iterations=DEFAULT_MAX_ITERATIONS, task_count=1, parent_agent=parent, role=request.role,
+            **route_overrides,
         )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:

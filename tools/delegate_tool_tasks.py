@@ -18,6 +18,36 @@ _TEMPLATE_MARKER_RE = re.compile(
 )
 _MIN_BATCH_GOAL_LEN = 10
 
+def _validate_task_route_field(value: Any, field: str, task_index: int) -> Optional[str]:
+    """``None`` (absent) is always fine. Present values must be a non-empty string with no
+    leading/trailing whitespace, preserved verbatim -- malformed input is rejected outright,
+    never silently repaired (stripped/coerced)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return f"Task {task_index} '{field}' must be a string, got {type(value).__name__}."
+    if value == "":
+        return f"Task {task_index} '{field}' must not be empty; omit the field to inherit instead."
+    if value != value.strip():
+        return f"Task {task_index} '{field}' must not have leading/trailing whitespace ({value!r})."
+    return None
+
+def _validate_task_route_overrides(task_list: List[Dict[str, Any]]) -> Optional[str]:
+    """Preflight over the WHOLE batch before any child spawns: reject malformed per-task
+    'model'/'provider' identifiers and 'provider' set without 'model', so one bad task fails
+    the whole call with zero children spawned (never a partial batch)."""
+    for i, task in enumerate(task_list):
+        model, provider = task.get("model"), task.get("provider")
+        err = _validate_task_route_field(model, "model", i) or _validate_task_route_field(provider, "provider", i)
+        if err:
+            return err
+        if provider is not None and model is None:
+            return (
+                f"Task {i} sets 'provider' ({provider!r}) without 'model'. provider requires "
+                "model — add a 'model' to this task, or drop 'provider' to inherit both."
+            )
+    return None
+
 def _recover_tasks_from_json_string(tasks: Any) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
     """``(parsed_list, None)`` for a JSON-array string, ``(None, error)`` for a bad string, ``(None, None)`` otherwise."""
     if not isinstance(tasks, str):
@@ -100,6 +130,11 @@ def _normalize_task_list(
             return None, f"Task {i} must be an object, got {type(task).__name__}."
         if not task.get("goal", "").strip():
             return None, f"Task {i} is missing a 'goal'."
+    # Route-override preflight applies to every shape (single-goal form included): a
+    # single-task call can set model/provider too.
+    route_error = _validate_task_route_overrides(task_list)
+    if route_error:
+        return None, route_error
     # The single-goal form is exempt from the batch gate (short goals are valid there).
     batch_error = _validate_batch_tasks(task_list) if isinstance(tasks, list) else None
     return (None, batch_error) if batch_error else (task_list, None)
