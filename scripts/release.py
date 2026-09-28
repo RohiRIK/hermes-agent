@@ -30,6 +30,17 @@ from scripts.releases.authors import resolve_author  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# GitHub rejects release bodies over 125000 characters (HTTP 422). Leave
+# headroom so later builds-table injection can still edit the draft.
+GITHUB_RELEASE_BODY_MAX = 125000
+RELEASE_NOTES_SOFT_MAX = 120000
+_RELEASE_NOTES_TRUNCATION_NOTICE = (
+    "\n\n---\n\n"
+    "_Release notes truncated to fit GitHub's "
+    f"{GITHUB_RELEASE_BODY_MAX}-character release body limit. "
+    "See the Full Changelog link for the complete history._\n"
+)
+
 
 def git(*args, cwd=None):
     """Run a git command and return stdout."""
@@ -301,6 +312,28 @@ def get_pr_number(subject: str) -> str | None:
     return None
 
 
+
+def clamp_release_notes(notes: str, *, limit: int = RELEASE_NOTES_SOFT_MAX) -> str:
+    """Cap release notes under GitHub's release-body maximum.
+
+    Prefers a newline boundary so truncation does not split a bullet mid-line.
+    The soft limit leaves room for later builds-table edits on the same draft.
+    """
+    if limit > GITHUB_RELEASE_BODY_MAX:
+        raise ValueError("Release notes limit cannot exceed GitHub's body maximum")
+    if len(notes) <= limit:
+        return notes
+    notice = _RELEASE_NOTES_TRUNCATION_NOTICE
+    budget = limit - len(notice)
+    if budget < 256:
+        return notes[:limit]
+    truncated = notes[:budget]
+    last_nl = truncated.rfind("\n")
+    if last_nl >= budget // 2:
+        truncated = truncated[:last_nl]
+    return truncated + notice
+
+
 def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/NousResearch/hermes-agent",
                        prev_tag=None, first_release=False, no_changelog=False):
     """Generate markdown changelog from categorized commits."""
@@ -441,7 +474,14 @@ def _resume_canary(tag: str, remote: str, repository: str, *, notes_file: Path |
             "--verify-tag", "--draft", "--prerelease",
             "--title", f"Hermes Agent canary {tag}",
         ]
-        create.extend(["--notes-file", str(notes_file)] if notes_file else ["--generate-notes"])
+        # Never use --generate-notes here: on a fork with no prior canary
+        # baseline it can exceed GitHub's 125000-character body limit (HTTP 422).
+        if notes_file is not None:
+            clamped = clamp_release_notes(notes_file.read_text(encoding="utf-8"))
+            notes_file.write_text(clamped, encoding="utf-8")
+            create.extend(["--notes-file", str(notes_file)])
+        else:
+            create.extend(["--notes", f"Hermes Agent canary {tag}."])
         created = subprocess.run(
             create, cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
         )
@@ -547,7 +587,7 @@ def cmd_canary(args) -> None:
     print(f"✓ Pushed {tag_name} to {push_remote}")
 
     changelog_file = REPO_ROOT / ".release_notes.md"
-    changelog_file.write_text(changelog, encoding="utf-8")
+    changelog_file.write_text(clamp_release_notes(changelog), encoding="utf-8")
     _resume_canary(tag_name, push_remote, gh_repo, notes_file=changelog_file)
     changelog_file.unlink(missing_ok=True)
     # Record the tag for any workflow step that wants it. release.py
